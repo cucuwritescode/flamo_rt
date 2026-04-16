@@ -47,7 +47,7 @@ class TestHeader:
     def test_includes_name(self):
         config = _wrap_config({"type": "Shell", "children": []}, name="MyReverb")
         code = json_to_faust(config)
-        assert "// MyReverb" in code
+        assert "//MyReverb" in code
 
     def test_includes_sample_rate(self):
         config = _wrap_config({"type": "Shell", "children": []}, fs=44100)
@@ -256,7 +256,9 @@ class TestComposition:
         code = json_to_faust(config)
         #recursion uses ~ operator
         assert "~" in code
-        assert "@(1000)" in code
+        #delays inside recursion are decremented by 1 to compensate for
+        #the implicit one-sample delay from the ~ operator
+        assert "@(999)" in code
         assert "*(0.5)" in code
 
     def test_shell_unwraps(self):
@@ -349,7 +351,9 @@ class TestFullFDN:
 
     def test_all_delays_present(self, fdn_config):
         code = json_to_faust(fdn_config)
-        for d in [1103, 1447, 1811, 2137]:
+        #delays are decremented by 1 inside recursion to compensate for
+        #the implicit one-sample delay from the ~ operator
+        for d in [1102, 1446, 1810, 2136]:
             assert f"@({d})" in code
 
     def test_feedback_matrix_hoisted(self, fdn_config):
