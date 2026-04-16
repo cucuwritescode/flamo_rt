@@ -9,6 +9,13 @@ faust composition operator, and each leaf module type maps to a faust
 dsp expression as defined in FLAMO_RT_SPEC.md section 5.
 
 the generated code is deterministic: same config always yields same output.
+
+note on fdn topology:
+    faust's ~ operator introduces exactly one sample of implicit delay
+    in the feedback path. when generating delay lines that participate
+    in a recursive structure, we must subtract one from the requested
+    delay length to compensate. the _emit_parallel_delay function
+    receives a flag indicating whether it sits inside a recursion.
 """
 
 from __future__ import annotations
@@ -22,11 +29,17 @@ def _fmt(x: float) -> str:
     """format a numeric value for faust source code.
 
     integers are written without decimal points.
-    floats keep enough precision to be faithful to the original.
+    floats are rounded to ten significant figures to avoid floating
+    point representation noise (e.g. 0.30000000000000004 becomes 0.3).
     """
-    if isinstance(x, int) or (isinstance(x, float) and x == int(x)):
+    if isinstance(x, int):
+        return str(x)
+    if isinstance(x, float) and x == int(x):
         return str(int(x))
-    return f"{x:.15g}"
+    #round to ten significant figures then format
+    #this eliminates floating point representation artefacts
+    rounded = float(f"{x:.10g}")
+    return f"{rounded:.15g}"
 
 
 #matrix row arithmetic
@@ -35,12 +48,14 @@ def _build_matrix_row(row: list[float], n_in: int) -> str:
     """build a faust arithmetic expression for one row of a mixing matrix.
 
     handles sign properly so output reads e.g. 0.5*x0 - 0.5*x1
-    rather than 0.5*x0 + -0.5*x1.
+    rather than 0.5*x0 + -0.5*x1. this makes the generated code
+    more readable and matches hand-written faust style.
     """
     parts: list[str] = []
     for j in range(n_in):
         coeff = row[j]
         if coeff == 0.0:
+            #zero coefficients contribute nothing, skip entirely
             continue
         #format the term without its sign
         abs_coeff = abs(coeff)
@@ -60,6 +75,7 @@ def _build_matrix_row(row: list[float], n_in: int) -> str:
             else:
                 parts.append(f"+ {term}")
     if not parts:
+        #entire row is zeros, output literal zero
         return "0.0"
     return " ".join(parts)
 
@@ -68,17 +84,89 @@ def _build_matrix_row(row: list[float], n_in: int) -> str:
 #each function takes a node dict and returns a faust expression string.
 #the expression operates on N parallel signal channels.
 
-def _emit_parallel_delay(node: dict[str, Any]) -> str:
+def _emit_parallel_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
     """parallel delay lines: one @(samples) per channel.
 
     faust @(n) delays a signal by n samples.
     channels are composed in parallel with the , operator.
+
+    when in_recursion is true, we subtract one sample from each delay
+    to compensate for the implicit one-sample delay introduced by
+    the ~ operator. this ensures the total delay matches the original
+    flamo specification. we clamp to zero to avoid negative delays.
     """
     samples = node["params"]["samples"]
     n = len(samples)
+
+    #compute effective delays, accounting for recursion offset
+    if in_recursion:
+        effective = [max(0, s - 1) for s in samples]
+    else:
+        effective = list(samples)
+
     if n == 1:
-        return f"@({samples[0]})"
-    channels = [f"@({s})" for s in samples]
+        return f"@({effective[0]})"
+    channels = [f"@({s})" for s in effective]
+    return "(" + " , ".join(channels) + ")"
+
+
+def _emit_variable_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
+    """variable delay using de.delay for runtime-variable delay times.
+
+    this is used when delays may change at runtime or when fractional
+    delays are needed. for fixed delays, @(n) is more efficient.
+
+    the maxdelay is set to the next power of two above the requested
+    delay, as faust delay buffers must be powers of two.
+    """
+    samples = node["params"]["samples"]
+    n = len(samples)
+
+    #find the maximum delay to size the buffer
+    max_delay = max(samples)
+    #round up to next power of two for efficient modulo
+    buffer_size = 1
+    while buffer_size < max_delay:
+        buffer_size *= 2
+
+    #compute effective delays, accounting for recursion offset
+    if in_recursion:
+        effective = [max(0, s - 1) for s in samples]
+    else:
+        effective = list(samples)
+
+    if n == 1:
+        return f"de.delay({buffer_size}, {effective[0]})"
+    channels = [f"de.delay({buffer_size}, {s})" for s in effective]
+    return "(" + " , ".join(channels) + ")"
+
+
+def _emit_fractional_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
+    """fractional delay using de.fdelay with linear interpolation.
+
+    used when delay times are not integer samples. faust's fdelay
+    interpolates between adjacent samples for smooth delay modulation.
+    """
+    samples = node["params"].get("samples_fractional", node["params"].get("samples", []))
+    n = len(samples)
+
+    #find the maximum delay to size the buffer
+    max_delay = max(samples) if samples else 1
+    max_delay_int = int(max_delay) + 2  #headroom for interpolation
+    #round up to next power of two
+    buffer_size = 1
+    while buffer_size < max_delay_int:
+        buffer_size *= 2
+
+    #compute effective delays, accounting for recursion offset
+    if in_recursion:
+        effective = [max(0.0, s - 1.0) for s in samples]
+    else:
+        effective = list(samples)
+
+    if n == 1:
+        return f"de.fdelay({buffer_size}, {_fmt(effective[0])})"
+    channels = [f"de.fdelay({buffer_size}, {_fmt(s)})" for s in effective]
     return "(" + " , ".join(channels) + ")"
 
 
@@ -86,6 +174,7 @@ def _emit_diagonal_gain(node: dict[str, Any]) -> str:
     """diagonal (per-channel) gains: *(g0), *(g1), ...
 
     each channel is multiplied by its own gain coefficient.
+    this is the efficient form when no cross-channel mixing occurs.
     """
     gains = node["params"]["gains"]
     n = len(gains)
@@ -95,15 +184,16 @@ def _emit_diagonal_gain(node: dict[str, Any]) -> str:
     return "(" + " , ".join(channels) + ")"
 
 
-
 def _emit_matrix_as_function(node: dict[str, Any]) -> tuple[str, str]:
     """emit a matrix as a separate faust function definition.
 
     returns (function_name, function_definition_string).
-    the caller can place the definition at the top of the dsp file
-    and use the function name inline.
+    the caller places the definition at the top of the dsp file
+    and uses the function name inline.
 
     the function signature is: name(x0, x1, ...) = row0, row1, ...;
+    this expands to explicit sum-of-products for each output channel,
+    which faust compiles efficiently.
     """
     matrix = node["params"]["matrix"]
     n_out = len(matrix)
@@ -112,8 +202,8 @@ def _emit_matrix_as_function(node: dict[str, Any]) -> tuple[str, str]:
 
     args = ", ".join(f"x{j}" for j in range(n_in))
     rows = [_build_matrix_row(matrix[i], n_in) for i in range(n_out)]
-    body = ", ".join(rows)
-    definition = f"{name}({args}) = {body};"
+    body = ",\n    ".join(rows)
+    definition = f"{name}({args}) =\n    {body};"
     return name, definition
 
 
@@ -125,6 +215,9 @@ def _emit_sos_filter(node: dict[str, Any]) -> str:
 
     the sos data is already normalised (a0 = 1) by flamo_to_json.
     shape: sos[section][channel] = [b0, b1, b2, a1, a2].
+
+    cascading multiple biquads in series builds higher-order filters
+    while maintaining numerical stability.
     """
     sos = node["params"]["sos"]
     n_sections = len(sos)
@@ -145,11 +238,137 @@ def _emit_sos_filter(node: dict[str, Any]) -> str:
             channels.append(sections[0])
         else:
             #cascade: section0 : section1 : ...
-            channels.append(" : ".join(sections))
+            channels.append("(" + " : ".join(sections) + ")")
 
     if n_channels == 1:
         return channels[0]
     return "(" + " , ".join(channels) + ")"
+
+
+def _emit_biquad_filter(node: dict[str, Any]) -> str:
+    """single biquad filter (second-order iir).
+
+    expects params with keys: b0, b1, b2, a1, a2 (normalised, a0=1)
+    or a coeffs list [b0, b1, b2, a1, a2].
+    """
+    params = node["params"]
+
+    #handle both dict and list coefficient formats
+    if "coeffs" in params:
+        b0, b1, b2, a1, a2 = params["coeffs"]
+    else:
+        b0 = params.get("b0", 1.0)
+        b1 = params.get("b1", 0.0)
+        b2 = params.get("b2", 0.0)
+        a1 = params.get("a1", 0.0)
+        a2 = params.get("a2", 0.0)
+
+    return f"fi.tf2({_fmt(b0)}, {_fmt(b1)}, {_fmt(b2)}, {_fmt(a1)}, {_fmt(a2)})"
+
+
+def _emit_svf_filter(node: dict[str, Any]) -> str:
+    """state variable filter.
+
+    svf provides simultaneous lowpass, highpass, bandpass outputs.
+    we emit the appropriate fi.svf variant based on the mode parameter.
+    defaults to lowpass if mode is unspecified.
+    """
+    params = node["params"]
+    fc = params.get("fc", 1000.0)
+    q = params.get("q", 0.707)
+    mode = params.get("mode", "lowpass")
+
+    #map mode to faust svf function
+    mode_map = {
+        "lowpass": "fi.svf.lp",
+        "highpass": "fi.svf.hp",
+        "bandpass": "fi.svf.bp",
+        "notch": "fi.svf.notch",
+        "allpass": "fi.svf.ap",
+    }
+    svf_func = mode_map.get(mode, "fi.svf.lp")
+    return f"{svf_func}({_fmt(fc)}, {_fmt(q)})"
+
+
+def _emit_lowpass_filter(node: dict[str, Any]) -> str:
+    """butterworth lowpass filter.
+
+    uses fi.lowpass(order, cutoff_freq).
+    """
+    params = node["params"]
+    order = params.get("order", 2)
+    fc = params.get("fc", 1000.0)
+    return f"fi.lowpass({order}, {_fmt(fc)})"
+
+
+def _emit_highpass_filter(node: dict[str, Any]) -> str:
+    """butterworth highpass filter.
+
+    uses fi.highpass(order, cutoff_freq).
+    """
+    params = node["params"]
+    order = params.get("order", 2)
+    fc = params.get("fc", 1000.0)
+    return f"fi.highpass({order}, {_fmt(fc)})"
+
+
+def _emit_bandpass_filter(node: dict[str, Any]) -> str:
+    """butterworth bandpass filter.
+
+    uses fi.bandpass(order, low_freq, high_freq).
+    """
+    params = node["params"]
+    order = params.get("order", 2)
+    fl = params.get("fl", 100.0)
+    fh = params.get("fh", 1000.0)
+    return f"fi.bandpass({order}, {_fmt(fl)}, {_fmt(fh)})"
+
+
+def _emit_peak_eq(node: dict[str, Any]) -> str:
+    """parametric peaking equaliser.
+
+    uses fi.peak_eq(gain_db, centre_freq, bandwidth).
+    """
+    params = node["params"]
+    gain_db = params.get("gain_db", 0.0)
+    fc = params.get("fc", 1000.0)
+    bw = params.get("bandwidth", 100.0)
+    return f"fi.peak_eq({_fmt(gain_db)}, {_fmt(fc)}, {_fmt(bw)})"
+
+
+def _emit_allpass_comb(node: dict[str, Any]) -> str:
+    """allpass comb filter (schroeder allpass).
+
+    used in reverb networks for diffusion without colouration.
+    uses fi.allpass_comb(maxdelay, delay, feedback).
+    """
+    params = node["params"]
+    delay = params.get("delay", 100)
+    feedback = params.get("feedback", 0.5)
+    #buffer size must be power of two and larger than delay
+    buffer_size = 1
+    while buffer_size <= delay:
+        buffer_size *= 2
+    return f"fi.allpass_comb({buffer_size}, {delay}, {_fmt(feedback)})"
+
+
+def _emit_dc_blocker(node: dict[str, Any]) -> str:
+    """dc blocking filter to remove dc offset.
+
+    uses fi.dcblocker which is a one-pole highpass at very low frequency.
+    """
+    return "fi.dcblocker"
+
+
+def _emit_onepole(node: dict[str, Any]) -> str:
+    """one-pole lowpass filter.
+
+    simple exponential smoothing: y[n] = x[n] + p*y[n-1]
+    uses fi.pole(coefficient).
+    """
+    params = node["params"]
+    p = params.get("pole", 0.9)
+    return f"fi.pole({_fmt(p)})"
 
 
 #safe naming for faust identifiers
@@ -158,6 +377,8 @@ def _safe_name(name: str) -> str:
     """convert a node name to a valid faust identifier.
 
     replaces non-alphanumeric characters with underscores.
+    faust identifiers must start with a letter or underscore,
+    so we prepend underscore if the name starts with a digit.
     """
     result = []
     for c in name:
@@ -178,6 +399,8 @@ def _get_channel_count(node: dict[str, Any] | None) -> int | None:
 
     checks output_channels on leaf nodes, and recurses into
     container nodes to find a leaf with channel information.
+    this is necessary for constructing the correct number of
+    adders at the recursion input.
     """
     if node is None:
         return None
@@ -212,11 +435,16 @@ class _FaustEmitter:
     separates concerns: leaf emitters produce expressions,
     the emitter handles composition and collects top-level definitions
     (like matrix functions) that need to be hoisted.
+
+    the in_recursion flag tracks whether we are inside a recursion
+    node, which affects delay offset calculation.
     """
 
     def __init__(self):
         #top-level function definitions collected during traversal
         self.definitions: list[str] = []
+        #track recursion depth for delay offset
+        self._in_recursion: bool = False
 
     def emit(self, node: dict[str, Any]) -> str:
         """dispatch to the appropriate handler based on node type."""
@@ -236,7 +464,12 @@ class _FaustEmitter:
         raise ValueError(f"unknown node type: {node_type}")
 
     def _emit_shell(self, node: dict[str, Any]) -> str:
-        """shell: skip the fft/ifft wrapper, emit the core only."""
+        """shell: skip the fft/ifft wrapper, emit the core only.
+
+        flamo's shell wraps a time-domain core with frequency-domain
+        io layers. for faust we emit only the core, as faust operates
+        purely in the time domain.
+        """
         children = node.get("children", [])
         if not children:
             return "_"
@@ -244,7 +477,11 @@ class _FaustEmitter:
         return self.emit(children[0])
 
     def _emit_series(self, node: dict[str, Any]) -> str:
-        """series composition: a : b : c"""
+        """series composition: a : b : c
+
+        sequential chaining where the output of each stage feeds
+        the input of the next. the : operator in faust.
+        """
         children = node.get("children", [])
         if not children:
             return "_"
@@ -254,7 +491,12 @@ class _FaustEmitter:
         return "(" + " : ".join(parts) + ")"
 
     def _emit_parallel(self, node: dict[str, Any]) -> str:
-        """parallel composition: a , b or a , b :> _ (if summing)."""
+        """parallel composition: a , b or a , b :> _ (if summing).
+
+        side-by-side composition where inputs and outputs are
+        concatenated. if sum_output is true, we add :> _ to
+        sum all outputs to a single channel.
+        """
         children = node.get("children", [])
         if not children:
             return "_"
@@ -275,11 +517,22 @@ class _FaustEmitter:
         by feedback leaving no external inputs. the fdn needs external inputs
         to enter the loop, so we prepend par(i,N,+) to fF. this creates N
         additional inputs that get summed with the N feedback signals.
+
+        critically, the ~ operator introduces exactly one sample of delay
+        in the feedback path. we set _in_recursion=True so that delay
+        emitters can compensate by subtracting one from their delay times.
         """
         ff_node = node.get("fF")
         fb_node = node.get("fB")
 
+        #mark that we are inside a recursion so delays compensate
+        old_in_recursion = self._in_recursion
+        self._in_recursion = True
+
         ff_expr = self.emit(ff_node) if ff_node else "_"
+
+        #feedback path is not affected by the delay offset
+        self._in_recursion = old_in_recursion
         fb_expr = self.emit(fb_node) if fb_node else "_"
 
         #determine the feedback channel count from fB's output or fF's input
@@ -296,13 +549,33 @@ class _FaustEmitter:
         return f"({ff_expr} ~ {fb_expr})"
 
     def _emit_leaf(self, node: dict[str, Any]) -> str:
-        """dispatch to the correct leaf emitter based on module_type."""
+        """dispatch to the correct leaf emitter based on module_type.
+
+        each module type has its own emitter function that produces
+        the appropriate faust expression. unknown types become
+        passthrough wires with a warning comment.
+        """
         module_type = node.get("module_type", "")
         params = node.get("params", {})
 
+        #delay modules
         if module_type == "parallelDelay":
-            return _emit_parallel_delay(node)
+            #check if fractional delays are present
+            if "samples_fractional" in params:
+                return _emit_fractional_delay(node, self._in_recursion)
+            return _emit_parallel_delay(node, self._in_recursion)
 
+        if module_type == "Delay":
+            #single-channel delay, treat as parallel with one channel
+            return _emit_parallel_delay(node, self._in_recursion)
+
+        if module_type == "variableDelay":
+            return _emit_variable_delay(node, self._in_recursion)
+
+        if module_type == "fractionalDelay":
+            return _emit_fractional_delay(node, self._in_recursion)
+
+        #gain modules
         if module_type in ("Gain", "Matrix"):
             if "matrix" in params:
                 #hoist the matrix as a top-level function definition
@@ -317,13 +590,56 @@ class _FaustEmitter:
         if module_type == "parallelGain":
             return _emit_diagonal_gain(node)
 
+        #filter modules
         if module_type == "parallelSOSFilter":
             return _emit_sos_filter(node)
+
+        if module_type == "Biquad":
+            return _emit_biquad_filter(node)
+
+        if module_type == "SVF":
+            return _emit_svf_filter(node)
+
+        if module_type == "lowpass":
+            return _emit_lowpass_filter(node)
+
+        if module_type == "highpass":
+            return _emit_highpass_filter(node)
+
+        if module_type == "bandpass":
+            return _emit_bandpass_filter(node)
+
+        if module_type in ("PEQ", "peakEQ"):
+            return _emit_peak_eq(node)
+
+        if module_type == "allpassComb":
+            return _emit_allpass_comb(node)
+
+        if module_type == "dcBlocker":
+            return _emit_dc_blocker(node)
+
+        if module_type == "onePole":
+            return _emit_onepole(node)
+
+        #parallel filter applies the same filter to each channel
+        if module_type == "parallelFilter":
+            #extract the inner filter type and emit it for each channel
+            inner_type = params.get("filter_type", "lowpass")
+            n_ch = node.get("output_channels", 1)
+            inner_node = {
+                "module_type": inner_type,
+                "params": params,
+            }
+            inner_expr = self._emit_leaf(inner_node)
+            if n_ch == 1:
+                return inner_expr
+            channels = [inner_expr] * n_ch
+            return "(" + " , ".join(channels) + ")"
 
         #unknown module type with no specific handler
         #emit a wire (passthrough) and leave a comment in the definitions
         self.definitions.append(
-            f"// warning: no codegen for module type '{module_type}' "
+            f"//warning: no codegen for module type '{module_type}' "
             f"(node '{node.get('name', '?')}')"
         )
         return "_"
@@ -357,12 +673,21 @@ def json_to_faust(config: dict[str, Any]) -> str:
     #assemble the complete dsp file
     lines = []
 
-    #header
-    lines.append(f"// {name}")
-    lines.append(f"// sample rate: {fs} hz")
+    #header with metadata
+    lines.append(f"//{name}")
+    lines.append(f"//sample rate: {fs} hz")
     lines.append("")
+
+    #faust standard library import
     lines.append('import("stdfaust.lib");')
     lines.append("")
+
+    #topology documentation for fdn structures
+    if "Recursion" in str(config):
+        lines.append("//fdn topology: (adders : delays : filters) ~ feedback_matrix")
+        lines.append("//the ~ operator adds one sample implicit delay in feedback")
+        lines.append("//delay lengths are adjusted to compensate for this")
+        lines.append("")
 
     #hoisted definitions (matrices, warnings)
     if emitter.definitions:
