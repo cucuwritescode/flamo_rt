@@ -510,17 +510,28 @@ class _FaustEmitter:
         return f"({parallel_expr})"
 
     def _emit_recursion(self, node: dict[str, Any]) -> str:
-        """recursion (feedback): (par(i,N,+) : fF) ~ fB
+        """recursion (feedback): (interleave : adders : fF) ~ fB
 
-        faust's ~ operator feeds fB's outputs back to fF's first inputs.
-        if fF and fB have the same channel count, all fF inputs are consumed
-        by feedback leaving no external inputs. the fdn needs external inputs
-        to enter the loop, so we prepend par(i,N,+) to fF. this creates N
-        additional inputs that get summed with the N feedback signals.
+        faust's ~ operator feeds fB's m outputs back to the first m
+        inputs of A, with the remaining n inputs as external inputs.
+        we prepend par(i,N,+) so that each adder sums one feedback
+        signal with one external signal.
 
-        critically, the ~ operator introduces exactly one sample of delay
+        for N>1 channels, the input layout of par(i,N,+) is:
+            [add0_a, add0_b, add1_a, add1_b, ...]
+        but ~ delivers feedback to the first N inputs contiguously:
+            [fb0, fb1, ..., fbN-1, ext0, ext1, ..., extN-1]
+        without interleaving, adder 0 would get (fb0 + fb1) instead
+        of (fb0 + ext0). ro.interleave(N,2) reshuffles inputs so
+        each adder receives its corresponding feedback and external
+        signal as a pair.
+
+        for N=1, the single + has two inputs [fb, ext] and no
+        interleaving is needed.
+
+        the ~ operator introduces exactly one sample of implicit delay
         in the feedback path. we set _in_recursion=True so that delay
-        emitters can compensate by subtracting one from their delay times.
+        emitters compensate by subtracting one from their delay times.
         """
         ff_node = node.get("fF")
         fb_node = node.get("fB")
@@ -543,7 +554,9 @@ class _FaustEmitter:
             if n_fb == 1:
                 adders = "+"
             else:
-                adders = f"par(i, {n_fb}, +)"
+                #interleave feedback and external signals so each adder
+                #receives one of each: [fb0,ext0, fb1,ext1, ...]
+                adders = f"ro.interleave({n_fb}, 2) : par(i, {n_fb}, +)"
             return f"(({adders} : {ff_expr}) ~ {fb_expr})"
 
         return f"({ff_expr} ~ {fb_expr})"
