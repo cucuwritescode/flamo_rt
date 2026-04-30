@@ -73,6 +73,97 @@ def _detect_module_type(module: Any) -> str:
     return _MODULE_TYPE_MAP.get(name, name)
 
 
+#flamo constructor metadata extraction
+#these fields are ignored by json_to_faust but are needed
+#by json_to_flamo to reconstruct the original model without
+#ambiguity. they live under a "flamo" key on each node.
+
+#constructor arguments shared by all flamo dsp modules
+_COMMON_ATTRS = ("nfft", "alias_decay_db")
+
+#constructor arguments specific to each module type.
+#each entry lists attribute names to read from the module.
+_MODULE_ATTRS: dict[str, tuple[str, ...]] = {
+    "parallelDelay": ("max_len", "unit", "isint"),
+    "Gain": (),
+    "parallelGain": (),
+    "Matrix": (),
+    "Biquad": ("n_sections", "filter_type"),
+    "parallelBiquad": ("n_sections", "filter_type"),
+    "SVF": ("n_sections", "filter_type"),
+    "parallelSVF": ("n_sections", "filter_type"),
+    "parallelSOSFilter": (),
+    "SOSFilter": (),
+    "GEQ": (),
+    "PEQ": (),
+    "AccurateGEQ": (),
+}
+
+
+def _to_native(val: Any) -> Any:
+    """convert a value to a json-serialisable python native type.
+
+    handles numpy scalars, torch tensors, and other numeric types
+    that flamo modules may store as attributes.
+    """
+    #torch tensors (check by attribute to avoid importing torch)
+    if hasattr(val, "item") and callable(val.item):
+        return val.item()
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float, str)):
+        return val
+    return None
+
+
+def _extract_flamo_meta(module: Any, module_type: str) -> dict[str, Any]:
+    """extract constructor arguments from a flamo module for round-tripping.
+
+    reads the common attributes (nfft, alias_decay_db) and any
+    module-specific attributes listed in _MODULE_ATTRS. also
+    captures requires_grad from the parameter tensor if present.
+    """
+    meta: dict[str, Any] = {}
+
+    #common attributes shared by all dsp modules
+    for attr in _COMMON_ATTRS:
+        val = getattr(module, attr, None)
+        if val is not None:
+            native = _to_native(val)
+            if native is not None:
+                meta[attr] = native
+
+    #module-specific attributes
+    for attr in _MODULE_ATTRS.get(module_type, ()):
+        val = getattr(module, attr, None)
+        if val is not None:
+            native = _to_native(val)
+            if native is not None:
+                meta[attr] = native
+
+    #requires_grad from the parameter tensor
+    param = getattr(module, "param", None)
+    if param is not None and hasattr(param, "requires_grad"):
+        meta["requires_grad"] = bool(param.requires_grad)
+
+    #size: read from the module if available, otherwise infer from
+    #input/output channels. this is the constructor size argument.
+    size = getattr(module, "size", None)
+    if size is not None:
+        if hasattr(size, "__iter__"):
+            meta["size"] = [_to_native(s) or s for s in size]
+        else:
+            meta["size"] = [_to_native(size) or size]
+
+    return meta
+
+
 #parameter extraction
 
 def _extract_param(module: Any) -> np.ndarray | None:
@@ -182,6 +273,11 @@ def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
     if out_ch is not None:
         node["output_channels"] = int(out_ch)
 
+    #flamo constructor metadata for round-tripping via json_to_flamo
+    flamo_meta = _extract_flamo_meta(module, module_type)
+    if flamo_meta:
+        node["flamo"] = flamo_meta
+
     if param is None:
         node["params"] = {}
         return node
@@ -278,6 +374,17 @@ def _traverse(model: Any, name: str, fs: float) -> dict[str, Any]:
             node["children"] = [_traverse(core, "core", fs)]
         else:
             node["children"] = []
+
+        #capture nfft from the io layers for round-tripping
+        flamo_meta: dict[str, Any] = {}
+        input_layer = getattr(model, "input_layer", None)
+        if input_layer is not None:
+            nfft = getattr(input_layer, "nfft", None)
+            if nfft is not None:
+                flamo_meta["nfft"] = int(nfft)
+        if flamo_meta:
+            node["flamo"] = flamo_meta
+
         return node
 
     #series: ordered sequence of children
