@@ -469,3 +469,131 @@ class TestEdgeCases:
         config = _wrap_config(node)
         code = json_to_faust(config)
         assert "*(-0.707)" in code
+
+    def test_float_representation_noise(self):
+        #0.3 in ieee754 is 0.30000000000000004. _fmt must clean this up.
+        node = _leaf("g", "parallelGain", {"gains": [0.30000000000000004]}, n_ch=1)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "*(0.3)" in code
+        assert "0.30000000000000004" not in code
+
+
+#fractional and variable delay tests
+
+class TestFractionalDelayCodegen:
+    def test_single_fractional_delay(self):
+        node = _leaf("d", "fractionalDelay",
+                      {"samples": [1000.5]}, n_ch=1)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "de.fdelay(" in code
+        assert "1000.5" in code
+
+    def test_multiple_fractional_delays(self):
+        node = _leaf("d", "fractionalDelay",
+                      {"samples": [500.3, 750.7, 1000.1]}, n_ch=3)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert code.count("de.fdelay(") == 3
+        assert "500.3" in code
+        assert "750.7" in code
+        assert "1000.1" in code
+
+    def test_fractional_delay_buffer_size(self):
+        #buffer size should be next power of two above the max delay
+        node = _leaf("d", "fractionalDelay",
+                      {"samples": [1000.5]}, n_ch=1)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        #max delay 1000.5, int + 2 = 1002, next power of two = 1024
+        assert "de.fdelay(1024," in code
+
+    def test_fractional_delay_in_recursion(self):
+        #fractional delays inside recursion are decremented by 1.0
+        delay = _leaf("d", "fractionalDelay",
+                       {"samples": [500.5]}, n_ch=1)
+        gain = _leaf("g", "parallelGain", {"gains": [0.5]}, n_ch=1)
+        rec = {
+            "type": "Recursion",
+            "name": "loop",
+            "fF": delay,
+            "fB": gain,
+        }
+        config = _wrap_config(rec)
+        code = json_to_faust(config)
+        #500.5 - 1.0 = 499.5
+        assert "499.5" in code
+
+    def test_fractional_delay_samples_fractional_key(self):
+        #the emitter also accepts "samples_fractional" as the param key
+        node = _leaf("d", "parallelDelay",
+                      {"samples_fractional": [200.25, 300.75]}, n_ch=2)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "de.fdelay(" in code
+        assert "200.25" in code
+        assert "300.75" in code
+
+    def test_variable_delay(self):
+        node = _leaf("d", "variableDelay",
+                      {"samples": [1000, 2000]}, n_ch=2)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert code.count("de.delay(") == 2
+        #buffer size: max 2000, next power of two = 2048
+        assert "de.delay(2048," in code
+
+    def test_variable_delay_in_recursion(self):
+        delay = _leaf("d", "variableDelay",
+                       {"samples": [1000]}, n_ch=1)
+        gain = _leaf("g", "parallelGain", {"gains": [0.7]}, n_ch=1)
+        rec = {
+            "type": "Recursion",
+            "name": "loop",
+            "fF": delay,
+            "fB": gain,
+        }
+        config = _wrap_config(rec)
+        code = json_to_faust(config)
+        #1000 - 1 = 999
+        assert "de.delay(1024, 999)" in code
+
+
+#topology comment tests
+
+class TestTopologyComments:
+    def test_fdn_has_topology_comments(self):
+        delay = _leaf("d", "parallelDelay",
+                       {"samples": [1103, 1447, 1811, 2137]})
+        matrix = [[0.5, 0.5, 0.5, 0.5],
+                  [0.5, -0.5, 0.5, -0.5],
+                  [0.5, 0.5, -0.5, -0.5],
+                  [0.5, -0.5, -0.5, 0.5]]
+        fb = _leaf("fB", "Gain", {"matrix": matrix})
+        rec = {"type": "Recursion", "name": "loop", "fF": delay, "fB": fb}
+        config = _wrap_config(rec)
+        code = json_to_faust(config)
+        assert "//fdn topology:" in code
+        assert "//4 delay lines:" in code
+        assert "23.0" in code  #1103/48000*1000 = 22.98 ~ 23.0
+        assert "//feedback matrix: 4x4" in code
+
+    def test_fdn_with_absorption_comments(self):
+        delay = _leaf("d", "parallelDelay", {"samples": [500]}, n_ch=1)
+        sos_node = _leaf("f", "parallelSOSFilter", {
+            "sos": [[[0.998, 0.0, 0.0, -0.002, 0.0]]]
+        }, n_ch=1)
+        fF = {"type": "Series", "name": "fF", "children": [delay, sos_node]}
+        fb = _leaf("g", "parallelGain", {"gains": [0.5]}, n_ch=1)
+        rec = {"type": "Recursion", "name": "loop", "fF": fF, "fB": fb}
+        config = _wrap_config(rec)
+        code = json_to_faust(config)
+        assert "//absorption: 1 biquad section per channel" in code
+
+    def test_no_topology_without_recursion(self):
+        #simple gain has no fdn topology to describe
+        node = _leaf("g", "parallelGain", {"gains": [0.5]}, n_ch=1)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "//fdn topology:" not in code

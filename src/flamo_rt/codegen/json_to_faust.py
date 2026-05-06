@@ -28,18 +28,16 @@ from typing import Any
 def _fmt(x: float) -> str:
     """format a numeric value for faust source code.
 
-    integers are written without decimal points.
-    floats are rounded to ten significant figures to avoid floating
-    point representation noise (e.g. 0.30000000000000004 becomes 0.3).
+    integers are written without decimal points (1000 not 1000.0).
+    floats use ten significant figures, which eliminates representation
+    noise (0.30000000000000004 becomes 0.3) while preserving more than
+    enough precision for audio coefficients.
     """
     if isinstance(x, int):
         return str(x)
     if isinstance(x, float) and x == int(x):
         return str(int(x))
-    #round to ten significant figures then format
-    #this eliminates floating point representation artefacts
-    rounded = float(f"{x:.10g}")
-    return f"{rounded:.15g}"
+    return f"{x:.10g}"
 
 
 #matrix row arithmetic
@@ -658,6 +656,75 @@ class _FaustEmitter:
         return "_"
 
 
+#topology description
+
+def _collect_nodes(node: dict[str, Any], type_filter: str) -> list[dict]:
+    """collect all nodes of a given type from the config tree."""
+    found = []
+    if node.get("type") == type_filter or node.get("module_type") == type_filter:
+        found.append(node)
+    for child in node.get("children", []):
+        found.extend(_collect_nodes(child, type_filter))
+    for key in ("fF", "fB"):
+        sub = node.get(key)
+        if sub is not None:
+            found.extend(_collect_nodes(sub, type_filter))
+    return found
+
+
+def _describe_topology(config: dict[str, Any], fs: int) -> list[str]:
+    """generate human-readable topology comments from the config tree.
+
+    returns a list of comment strings (without the // prefix).
+    returns an empty list if the config has no interesting structure.
+    """
+    desc: list[str] = []
+
+    #check for recursion (fdn feedback loops)
+    recursions = _collect_nodes(config, "Recursion")
+    if not recursions:
+        return desc
+
+    desc.append("fdn topology: (adders : delays : filters) ~ feedback_matrix")
+    desc.append("the ~ operator adds one sample implicit delay in feedback")
+    desc.append("delay lengths are adjusted to compensate for this")
+
+    #delay summary
+    delays = _collect_nodes(config, "parallelDelay")
+    if delays:
+        all_samples = []
+        for d in delays:
+            all_samples.extend(d.get("params", {}).get("samples", []))
+        if all_samples:
+            n_ch = len(all_samples)
+            d_min = min(all_samples)
+            d_max = max(all_samples)
+            ms_min = d_min / fs * 1000
+            ms_max = d_max / fs * 1000
+            desc.append(f"{n_ch} delay lines: {d_min}-{d_max} samples "
+                        f"({ms_min:.1f}-{ms_max:.1f} ms)")
+
+    #filter summary
+    sos_nodes = _collect_nodes(config, "parallelSOSFilter")
+    if sos_nodes:
+        total_sections = 0
+        for s in sos_nodes:
+            sos = s.get("params", {}).get("sos", [])
+            total_sections += len(sos)
+        desc.append(f"absorption: {total_sections} biquad section"
+                    f"{'s' if total_sections != 1 else ''} per channel")
+
+    #feedback matrix summary
+    for rec in recursions:
+        fb = rec.get("fB")
+        if fb and "matrix" in fb.get("params", {}):
+            matrix = fb["params"]["matrix"]
+            n = len(matrix)
+            desc.append(f"feedback matrix: {n}x{n}")
+
+    return desc
+
+
 #public api
 
 def json_to_faust(config: dict[str, Any]) -> str:
@@ -695,11 +762,13 @@ def json_to_faust(config: dict[str, Any]) -> str:
     lines.append('import("stdfaust.lib");')
     lines.append("")
 
-    #topology documentation for fdn structures
-    if "Recursion" in str(config):
-        lines.append("//fdn topology: (adders : delays : filters) ~ feedback_matrix")
-        lines.append("//the ~ operator adds one sample implicit delay in feedback")
-        lines.append("//delay lengths are adjusted to compensate for this")
+    #topology documentation extracted from the config tree.
+    #summarises the fdn structure so the generated code is readable
+    #without cross-referencing the json config.
+    topo = _describe_topology(config, fs)
+    if topo:
+        for line in topo:
+            lines.append(f"//{line}")
         lines.append("")
 
     #hoisted definitions (matrices, warnings)
