@@ -587,7 +587,7 @@ class _FaustEmitter:
             return _emit_fractional_delay(node, self._in_recursion)
 
         #gain modules
-        if module_type in ("Gain", "Matrix"):
+        if module_type in ("Gain", "Matrix", "HouseholderMatrix"):
             if "matrix" in params:
                 #hoist the matrix as a top-level function definition
                 func_name, func_def = _emit_matrix_as_function(node)

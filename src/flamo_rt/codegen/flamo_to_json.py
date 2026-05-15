@@ -55,6 +55,8 @@ _MODULE_TYPE_MAP = {
     "Gain": "Gain",
     "parallelGain": "parallelGain",
     "Matrix": "Matrix",
+    "HouseholderMatrix": "HouseholderMatrix",
+    "ScatteringMatrix": "ScatteringMatrix",
     "parallelFilter": "parallelFilter",
     "Biquad": "Biquad",
     "SVF": "SVF",
@@ -87,11 +89,13 @@ _MODULE_ATTRS: dict[str, tuple[str, ...]] = {
     "parallelDelay": ("max_len", "unit", "isint"),
     "Gain": (),
     "parallelGain": (),
-    "Matrix": (),
+    "Matrix": ("matrix_type", "iter"),
     "Biquad": ("n_sections", "filter_type"),
     "parallelBiquad": ("n_sections", "filter_type"),
     "SVF": ("n_sections", "filter_type"),
     "parallelSVF": ("n_sections", "filter_type"),
+    "HouseholderMatrix": (),
+    "ScatteringMatrix": ("sparsity", "gain_per_sample", "pulse_size"),
     "parallelSOSFilter": (),
     "SOSFilter": (),
     "GEQ": (),
@@ -288,7 +292,7 @@ def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
             "samples": _quantise_delays(param, fs),
         }
 
-    elif module_type in ("Gain", "Matrix"):
+    elif module_type in ("Gain", "Matrix", "HouseholderMatrix"):
         shape_class = _classify_gain(param)
         if shape_class == "matrix":
             node["params"] = {
