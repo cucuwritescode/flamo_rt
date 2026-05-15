@@ -6,7 +6,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-120%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)](#testing)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](FLAMO_RT_SPEC.md)
 
 *bridge the gap between differentiable audio research and deployable real-time plugins*
@@ -31,15 +31,16 @@ after:    FLAMO model (PyTorch)  →  flamo_rt  →  FAUST  →  plugin
 
 ```
 ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
-│    FLAMO     │       │     JSON     │       │    FAUST     │
-│    model     │  ───▶ │    config    │  ───▶ │    code      │
+│    FLAMO     │  ───▶ │     JSON     │  ───▶ │    FAUST     │
+│    model     │  ◀─── │    config    │       │    code      │
 │  (PyTorch)   │       │              │       │   (.dsp)     │
 └──────────────┘       └──────────────┘       └──────────────┘
-         flamo_to_json()        json_to_faust()
+       flamo_to_json() ──▶     json_to_faust() ──▶
+       json_to_flamo() ◀──
          ╰───────────── flamo_to_faust() ──────────────╯
 ```
 
-the pipeline traverses a FLAMO model graph, extracts all parameters (delays, gains, matrices, filters), serialises them to a JSON intermediate representation, and generates valid FAUST DSP code. the JSON stage decouples extraction from codegen and enables future backends.
+the pipeline traverses a FLAMO model graph, extracts all parameters (delays, gains, matrices, filters), serialises them to a JSON intermediate representation, and generates valid FAUST DSP code. `json_to_flamo` reconstructs the original model from the config, enabling exact round-tripping. the JSON stage decouples extraction from codegen and enables future backends.
 
 ## installation
 
@@ -106,7 +107,7 @@ pytest tests/ -q
 pytest tests/integration/ -v
 ```
 
-120 unit tests validate the full pipeline: parameter extraction, delay quantisation, SOS normalisation, gain classification, graph traversal, code generation, and end-to-end equivalence.
+133 unit tests validate the full pipeline: parameter extraction, delay quantisation, SOS normalisation, gain classification, graph traversal, code generation, and end-to-end equivalence.
 
 integration tests compare impulse responses between FLAMO (frequency domain) and generated FAUST (time domain) sample-by-sample.
 
@@ -117,6 +118,7 @@ src/flamo_rt/
   codegen/
     flamo_to_json.py     parameter extraction and graph traversal
     json_to_faust.py     FAUST code generation from JSON config
+    json_to_flamo.py     model reconstruction from JSON config
     flamo_to_faust.py    convenience wrapper (both steps)
 tests/
     test_flamo_to_json.py
@@ -131,7 +133,7 @@ tests/
 ## related projects
 
 - [FLAMO](https://github.com/gdalsanto/flamo) — differentiable audio processing framework
-- [pyFDN](https://github.com/gdalsanto/pyfdn) — python feedback delay networks
+- [pyFDN](https://github.com/artificial-audio/pyFDN) — python feedback delay networks
 - [FAUST](https://faust.grame.fr/) — functional audio stream
 
 ## licence
