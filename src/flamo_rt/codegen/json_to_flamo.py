@@ -92,6 +92,9 @@ def _build_leaf(
     if module_type == "parallelDelay":
         return _build_delay(node, params, meta, fs, m_nfft, m_adb, m_rg, device)
 
+    if module_type == "HouseholderMatrix":
+        return _build_householder(node, params, meta, m_nfft, m_adb, m_rg, device)
+
     if module_type in ("Gain", "Matrix"):
         return _build_gain(node, params, meta, m_nfft, m_adb, m_rg, device)
 
@@ -142,7 +145,12 @@ def _build_delay(node, params, meta, fs, nfft, adb, rg, device):
 
 
 def _build_gain(node, params, meta, nfft, adb, rg, device):
-    """construct a Gain module (matrix or diagonal)."""
+    """construct a Gain or Matrix module (matrix or diagonal).
+
+    if the flamo metadata contains matrix_type, reconstruct a Matrix
+    with the correct type so the map function matches the original.
+    otherwise fall back to a plain Gain.
+    """
     if "matrix" in params:
         values = np.array(params["matrix"], dtype=np.float64)
         n_out, n_in = values.shape
@@ -159,8 +167,39 @@ def _build_gain(node, params, meta, nfft, adb, rg, device):
         size = tuple(meta.get("size", (n_ch, n_ch)))
         values = np.eye(*size, dtype=np.float64)
 
-    mod = dsp.Gain(
-        size=size, nfft=nfft,
+    matrix_type = meta.get("matrix_type")
+    if matrix_type is not None:
+        m_iter = meta.get("iter", 1)
+        mod = dsp.Matrix(
+            size=size, nfft=nfft, matrix_type=matrix_type, iter=m_iter,
+            alias_decay_db=adb, device=device,
+        )
+    else:
+        mod = dsp.Gain(
+            size=size, nfft=nfft,
+            alias_decay_db=adb, device=device,
+        )
+    mod.assign_value(torch.as_tensor(values, dtype=torch.float32))
+    mod.param.requires_grad_(rg)
+    return mod
+
+
+def _build_householder(node, params, meta, nfft, adb, rg, device):
+    """construct a HouseholderMatrix module.
+
+    the json stores the unit vector as a column matrix (N, 1).
+    HouseholderMatrix internally sets size=(N, 1) and reconstructs
+    U = I - 2*u*u^T from the normalised vector.
+    """
+    if "matrix" in params:
+        values = np.array(params["matrix"], dtype=np.float64)
+        N = values.shape[0]
+    else:
+        N = node.get("input_channels", 1)
+        values = np.ones((N, 1), dtype=np.float64) / np.sqrt(N)
+
+    mod = dsp.HouseholderMatrix(
+        size=(N, N), nfft=nfft,
         alias_decay_db=adb, device=device,
     )
     mod.assign_value(torch.as_tensor(values, dtype=torch.float32))

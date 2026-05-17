@@ -58,6 +58,8 @@ _MODULE_TYPE_MAP = {
     "HouseholderMatrix": "HouseholderMatrix",
     "ScatteringMatrix": "ScatteringMatrix",
     "parallelFilter": "parallelFilter",
+    "parallelBiquad": "parallelBiquad",
+    "parallelSVF": "parallelSVF",
     "Biquad": "Biquad",
     "SVF": "SVF",
     "GEQ": "GEQ",
@@ -98,9 +100,10 @@ _MODULE_ATTRS: dict[str, tuple[str, ...]] = {
     "ScatteringMatrix": ("sparsity", "gain_per_sample", "pulse_size"),
     "parallelSOSFilter": (),
     "SOSFilter": (),
-    "GEQ": (),
-    "PEQ": (),
-    "AccurateGEQ": (),
+    "parallelFilter": (),
+    "GEQ": ("octave_interval", "fs"),
+    "PEQ": ("n_bands", "f_min", "f_max", "design", "fs"),
+    "AccurateGEQ": ("octave_interval", "fs"),
 }
 
 
